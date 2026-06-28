@@ -169,7 +169,7 @@ def find_osu_songs_folder():
             
     try:
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"osu!\DefaultIcon") as key:
-            val, _ = winreg.QueryValueEx(key, "")
+            val, _ignored_type = winreg.QueryValueEx(key, "")
             path = val.split('"')[1] if '"' in val else val.split(',')[0]
             osu_dir = os.path.dirname(path)
             songs_dir = os.path.join(osu_dir, "Songs")
@@ -222,9 +222,15 @@ def get_installed_beatmapsets(songs_dir):
     return installed
 
 def is_osu_running():
-    for proc in psutil.process_iter(['name']):
-        if proc.info['name'] and proc.info['name'].lower() == 'osu!.exe':
-            return True
+    try:
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() == 'osu!.exe':
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+    except Exception:
+        pass
     return False
 
 # ----- OSU DB PARSING LOGIC -----
@@ -312,11 +318,11 @@ def update_collection_db(db_path, collection_name, new_md5s):
         num_collections = struct.unpack('<I', f.read(4))[0]
         
         collections = {}
-        for _ in range(num_collections):
+        for _c_idx in range(num_collections):
             name = read_osu_string(f)
             num_maps = struct.unpack('<I', f.read(4))[0]
             maps = []
-            for _ in range(num_maps):
+            for _m_idx in range(num_maps):
                 maps.append(read_osu_string(f))
             collections[name] = maps
 
@@ -453,8 +459,12 @@ def main():
     setup_language()
     
     download_dir = "downloads"
-    if not os.path.exists(download_dir):
-        os.makedirs(download_dir)
+    try:
+        if not os.path.exists(download_dir):
+            os.makedirs(download_dir)
+    except Exception as e:
+        print(f"\nFATAL ERROR: Could not create '{download_dir}' folder. Check folder permissions!\nError: {e}")
+        return
 
     print("=" * 50)
     print(_('welcome'))
@@ -538,8 +548,11 @@ def main():
                             all_md5s.extend(get_local_folder_md5s(folder_path))
                             
                         db_path = os.path.join(osu_dir, "collection.db")
-                        update_collection_db(db_path, coll_name, all_md5s)
-                        print(_('collection_created', count=len(all_md5s), name=coll_name))
+                        try:
+                            update_collection_db(db_path, coll_name, all_md5s)
+                            print(_('collection_created', count=len(all_md5s), name=coll_name))
+                        except Exception as e:
+                            print(f"\n❌ Error updating collection.db: {e}")
 
                     if downloaded_files:
                         print(_('moving_files'))
@@ -579,4 +592,12 @@ def main():
             print(_('invalid_choice'))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("\n" + "="*50)
+        print("FATAL ERROR / КРИТИЧЕСКАЯ ОШИБКА:")
+        traceback.print_exc()
+        print("="*50)
+        input("\nPress Enter to exit / Нажмите Enter для выхода...")
