@@ -45,7 +45,8 @@ TEXTS = {
         "start_dl": "Start downloading? (y/n): ",
         "dl_cancelled": "Download cancelled.",
         "map_progress": "\nMap {current} of {total} (ID: {id}):",
-        "dl_complete": "\nDownload complete! Successfully downloaded {success} out of {total} maps.",
+        "map_skipped": "Map {id} is already installed, skipping download.",
+        "dl_complete": "\nDownload complete! Successfully downloaded {success} out of {total} maps ({skipped} skipped).",
         "dl_failed": "Failed to download {id} from {mirror}. Code: {code}",
         "dl_error": "Error downloading {id}: {error}",
         "found_osu": "\nFound osu! Songs folder:",
@@ -61,7 +62,9 @@ TEXTS = {
         "close_osu_warning": "\n⚠️ WARNING: osu! is currently running! Modifying the collection database while the game is open WILL corrupt or overwrite the changes.",
         "close_osu_prompt": "Please close osu! and press Enter to continue...",
         "calc_hashes": "Extracting beatmap hashes for the collection...",
-        "collection_created": "✅ Added {count} beatmap difficulties to collection '{name}'!"
+        "collection_created": "✅ Added {count} beatmap difficulties to collection '{name}'!",
+        "osu_path_prompt": "\nCould not auto-detect osu! folder. Please enter the full path to your osu! folder (or 'n' to skip): ",
+        "osu_path_invalid": "Invalid path or 'Songs' folder not found inside. Try again."
     },
     "ru": {
         "lang_prompt": "Choose language / Выберите язык (1 = English, 2 = Русский): ",
@@ -87,7 +90,8 @@ TEXTS = {
         "start_dl": "Начать скачивание? (y/n): ",
         "dl_cancelled": "Скачивание отменено.",
         "map_progress": "\nКарта {current} из {total} (ID: {id}):",
-        "dl_complete": "\nСкачивание завершено! Успешно скачано {success} из {total} карт.",
+        "map_skipped": "Карта {id} уже установлена, пропускаем скачивание.",
+        "dl_complete": "\nСкачивание завершено! Успешно скачано {success} из {total} карт (пропущено {skipped}).",
         "dl_failed": "Не удалось скачать {id} с {mirror}. Код: {code}",
         "dl_error": "Ошибка при скачивании {id}: {error}",
         "found_osu": "\nНайдена папка osu! Songs:",
@@ -103,7 +107,9 @@ TEXTS = {
         "close_osu_warning": "\n⚠️ ВНИМАНИЕ: Игра osu! сейчас запущена! Изменение базы данных коллекций при запущенной игре приведет к потере данных.",
         "close_osu_prompt": "Пожалуйста, закрой osu! и нажми Enter, чтобы продолжить...",
         "calc_hashes": "Извлечение хэшей карт для коллекции...",
-        "collection_created": "✅ Добавлено {count} сложностей в коллекцию '{name}'!"
+        "collection_created": "✅ Добавлено {count} сложностей в коллекцию '{name}'!",
+        "osu_path_prompt": "\nНе удалось автоматически найти папку osu!. Введите полный путь к папке osu! (или 'n' для отмены): ",
+        "osu_path_invalid": "Неверный путь или внутри нет папки 'Songs'. Попробуйте снова."
     }
 }
 
@@ -154,6 +160,13 @@ def setup_language():
     save_config(config)
 
 def find_osu_songs_folder():
+    config = load_config()
+    
+    if "osu_path" in config:
+        songs_dir = os.path.join(config["osu_path"], "Songs")
+        if os.path.exists(songs_dir):
+            return songs_dir
+            
     try:
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"osu!\DefaultIcon") as key:
             val, _ = winreg.QueryValueEx(key, "")
@@ -161,14 +174,52 @@ def find_osu_songs_folder():
             osu_dir = os.path.dirname(path)
             songs_dir = os.path.join(osu_dir, "Songs")
             if os.path.exists(songs_dir):
+                config["osu_path"] = osu_dir
+                save_config(config)
                 return songs_dir
     except Exception:
         pass
         
-    fallback = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'osu!', 'Songs')
-    if os.path.exists(fallback):
-        return fallback
-    return None
+    fallback = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'osu!')
+    songs_fallback = os.path.join(fallback, 'Songs')
+    if os.path.exists(songs_fallback):
+        config["osu_path"] = fallback
+        save_config(config)
+        return songs_fallback
+        
+    while True:
+        user_input = input(_('osu_path_prompt')).strip()
+        if user_input.lower() == 'n':
+            return None
+            
+        if os.path.basename(user_input).lower() == 'songs':
+            songs_dir = user_input
+            osu_dir = os.path.dirname(user_input)
+        else:
+            songs_dir = os.path.join(user_input, "Songs")
+            osu_dir = user_input
+            
+        if os.path.exists(songs_dir):
+            config["osu_path"] = osu_dir
+            save_config(config)
+            return songs_dir
+        else:
+            print(_('osu_path_invalid'))
+
+def get_installed_beatmapsets(songs_dir):
+    installed = {}
+    if not songs_dir or not os.path.exists(songs_dir):
+        return installed
+    try:
+        for item in os.listdir(songs_dir):
+            full_path = os.path.join(songs_dir, item)
+            if os.path.isdir(full_path):
+                match = re.match(r'^(\d+)', item)
+                if match:
+                    installed[match.group(1)] = full_path
+    except Exception as e:
+        pass
+    return installed
 
 def is_osu_running():
     for proc in psutil.process_iter(['name']):
@@ -230,6 +281,18 @@ def get_osz_md5s(filepath):
                     md5 = hashlib.md5(content).hexdigest()
                     md5s.append(md5)
     except Exception as e:
+        pass
+    return md5s
+
+def get_local_folder_md5s(folder_path):
+    md5s = []
+    try:
+        for f in os.listdir(folder_path):
+            if f.lower().endswith('.osu'):
+                with open(os.path.join(folder_path, f), 'rb') as file:
+                    md5 = hashlib.md5(file.read()).hexdigest()
+                    md5s.append(md5)
+    except Exception:
         pass
     return md5s
 
@@ -430,18 +493,29 @@ def main():
                 print(_('dl_cancelled'))
                 continue
             
+            osu_songs_dir = find_osu_songs_folder()
+            installed_sets = get_installed_beatmapsets(osu_songs_dir)
+            
             downloaded_files = []
+            skipped_sets = []
+            
             for i, bm_id in enumerate(beatmapset_ids, 1):
-                print(_('map_progress', current=i, total=len(beatmapset_ids), id=bm_id))
+                bm_id_str = str(bm_id)
+                print(_('map_progress', current=i, total=len(beatmapset_ids), id=bm_id_str))
+                
+                if bm_id_str in installed_sets:
+                    print(_('map_skipped', id=bm_id_str))
+                    skipped_sets.append((bm_id_str, installed_sets[bm_id_str]))
+                    continue
+                
                 filepath = download_beatmap(bm_id, download_dir, active_mirror)
                 if filepath:
                     downloaded_files.append(filepath)
                 time.sleep(0.5)
                 
-            print(_('dl_complete', success=len(downloaded_files), total=len(beatmapset_ids)))
+            print(_('dl_complete', success=len(downloaded_files), total=len(beatmapset_ids), skipped=len(skipped_sets)))
             
-            if downloaded_files:
-                osu_songs_dir = find_osu_songs_folder()
+            if downloaded_files or skipped_sets:
                 if osu_songs_dir:
                     print(f"{_('found_osu')} {osu_songs_dir}")
                     osu_dir = os.path.dirname(osu_songs_dir)
@@ -456,27 +530,32 @@ def main():
                         
                         print(_('calc_hashes'))
                         all_md5s = []
+                        
                         for fpath in downloaded_files:
                             all_md5s.extend(get_osz_md5s(fpath))
+                            
+                        for _, folder_path in skipped_sets:
+                            all_md5s.extend(get_local_folder_md5s(folder_path))
                             
                         db_path = os.path.join(osu_dir, "collection.db")
                         update_collection_db(db_path, coll_name, all_md5s)
                         print(_('collection_created', count=len(all_md5s), name=coll_name))
 
-                    print(_('moving_files'))
-                    moved_count = 0
-                    for file in downloaded_files:
-                        try:
-                            filename = os.path.basename(file)
-                            target_path = os.path.join(osu_songs_dir, filename)
-                            if os.path.exists(target_path):
-                                os.remove(target_path)
-                            shutil.move(file, target_path)
-                            moved_count += 1
-                        except Exception as e:
-                            print(_('move_error', file=file, error=str(e)))
-                            
-                    print(_('install_success', count=moved_count))
+                    if downloaded_files:
+                        print(_('moving_files'))
+                        moved_count = 0
+                        for file in downloaded_files:
+                            try:
+                                filename = os.path.basename(file)
+                                target_path = os.path.join(osu_songs_dir, filename)
+                                if os.path.exists(target_path):
+                                    os.remove(target_path)
+                                shutil.move(file, target_path)
+                                moved_count += 1
+                            except Exception as e:
+                                print(_('move_error', file=file, error=str(e)))
+                        print(_('install_success', count=moved_count))
+                    
                     print(_('press_f5'))
                     
                     if os.path.exists(osu_exe_path) and not is_osu_running():
