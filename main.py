@@ -534,7 +534,7 @@ def main():
                         for fpath in downloaded_files:
                             all_md5s.extend(get_osz_md5s(fpath))
                             
-                        for _, folder_path in skipped_sets:
+                        for skipped_id, folder_path in skipped_sets:
                             all_md5s.extend(get_local_folder_md5s(folder_path))
                             
                         db_path = os.path.join(osu_dir, "collection.db")
