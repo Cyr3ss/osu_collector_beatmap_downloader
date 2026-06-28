@@ -5,6 +5,10 @@ import requests
 import shutil
 import winreg
 import json
+import zipfile
+import hashlib
+import struct
+import psutil
 from urllib.parse import unquote
 from tqdm import tqdm
 
@@ -52,7 +56,12 @@ TEXTS = {
         "launch_osu": "\nDo you want to launch osu! right now? (y/n): ",
         "launching": "Launching game...",
         "launch_fail": "Failed to launch the game:",
-        "exit_msg": "Exiting program. Have fun playing!"
+        "exit_msg": "Exiting program. Have fun playing!",
+        "ask_collection": "Do you want to automatically create a collection named '{name}' in-game for these maps? (y/n): ",
+        "close_osu_warning": "\n⚠️ WARNING: osu! is currently running! Modifying the collection database while the game is open WILL corrupt or overwrite the changes.",
+        "close_osu_prompt": "Please close osu! and press Enter to continue...",
+        "calc_hashes": "Extracting beatmap hashes for the collection...",
+        "collection_created": "✅ Added {count} beatmap difficulties to collection '{name}'!"
     },
     "ru": {
         "lang_prompt": "Choose language / Выберите язык (1 = English, 2 = Русский): ",
@@ -89,7 +98,12 @@ TEXTS = {
         "launch_osu": "\nХочешь запустить osu! прямо сейчас? (y/n): ",
         "launching": "Запуск игры...",
         "launch_fail": "Не удалось запустить игру:",
-        "exit_msg": "Выход из программы. Приятной игры!"
+        "exit_msg": "Выход из программы. Приятной игры!",
+        "ask_collection": "Хочешь автоматически создать в игре коллекцию '{name}' для этих карт? (y/n): ",
+        "close_osu_warning": "\n⚠️ ВНИМАНИЕ: Игра osu! сейчас запущена! Изменение базы данных коллекций при запущенной игре приведет к потере данных.",
+        "close_osu_prompt": "Пожалуйста, закрой osu! и нажми Enter, чтобы продолжить...",
+        "calc_hashes": "Извлечение хэшей карт для коллекции...",
+        "collection_created": "✅ Добавлено {count} сложностей в коллекцию '{name}'!"
     }
 }
 
@@ -155,6 +169,118 @@ def find_osu_songs_folder():
     if os.path.exists(fallback):
         return fallback
     return None
+
+def is_osu_running():
+    for proc in psutil.process_iter(['name']):
+        if proc.info['name'] and proc.info['name'].lower() == 'osu!.exe':
+            return True
+    return False
+
+# ----- OSU DB PARSING LOGIC -----
+
+def read_uleb128(f):
+    result = 0
+    shift = 0
+    while True:
+        byte = f.read(1)
+        if not byte:
+            break
+        byte = byte[0]
+        result |= (byte & 0x7f) << shift
+        if (byte & 0x80) == 0:
+            break
+        shift += 7
+    return result
+
+def write_uleb128(f, value):
+    while True:
+        byte = value & 0x7f
+        value >>= 7
+        if value != 0:
+            byte |= 0x80
+        f.write(bytes([byte]))
+        if value == 0:
+            break
+
+def read_osu_string(f):
+    b = f.read(1)
+    if not b or b[0] == 0x00:
+        return ""
+    if b[0] == 0x0b:
+        length = read_uleb128(f)
+        return f.read(length).decode('utf-8')
+    return ""
+
+def write_osu_string(f, s):
+    if not s:
+        f.write(b'\x00')
+    else:
+        f.write(b'\x0b')
+        encoded = s.encode('utf-8')
+        write_uleb128(f, len(encoded))
+        f.write(encoded)
+
+def get_osz_md5s(filepath):
+    md5s = []
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z:
+            for info in z.infolist():
+                if info.filename.lower().endswith('.osu'):
+                    content = z.read(info)
+                    md5 = hashlib.md5(content).hexdigest()
+                    md5s.append(md5)
+    except Exception as e:
+        pass
+    return md5s
+
+def update_collection_db(db_path, collection_name, new_md5s):
+    if not os.path.exists(db_path):
+        with open(db_path, 'wb') as f:
+            f.write(struct.pack('<I', 20240101))
+            f.write(struct.pack('<I', 1))
+            write_osu_string(f, collection_name)
+            f.write(struct.pack('<I', len(new_md5s)))
+            for md5 in new_md5s:
+                write_osu_string(f, md5)
+        return
+
+    with open(db_path, 'rb') as f:
+        version = struct.unpack('<I', f.read(4))[0]
+        num_collections = struct.unpack('<I', f.read(4))[0]
+        
+        collections = {}
+        for _ in range(num_collections):
+            name = read_osu_string(f)
+            num_maps = struct.unpack('<I', f.read(4))[0]
+            maps = []
+            for _ in range(num_maps):
+                maps.append(read_osu_string(f))
+            collections[name] = maps
+
+    if collection_name in collections:
+        existing = set(collections[collection_name])
+        for m in new_md5s:
+            if m not in existing:
+                collections[collection_name].append(m)
+    else:
+        collections[collection_name] = new_md5s
+
+    temp_path = db_path + ".tmp"
+    with open(temp_path, 'wb') as f:
+        f.write(struct.pack('<I', version))
+        f.write(struct.pack('<I', len(collections)))
+        for name, maps in collections.items():
+            write_osu_string(f, name)
+            f.write(struct.pack('<I', len(maps)))
+            for md5 in maps:
+                write_osu_string(f, md5)
+    
+    if os.path.exists(db_path + ".bak"):
+        os.remove(db_path + ".bak")
+    shutil.copy2(db_path, db_path + ".bak")
+    shutil.move(temp_path, db_path)
+
+# --------------------------------
 
 def get_best_mirror(force_scan=False):
     config = load_config()
@@ -318,6 +444,25 @@ def main():
                 osu_songs_dir = find_osu_songs_folder()
                 if osu_songs_dir:
                     print(f"{_('found_osu')} {osu_songs_dir}")
+                    osu_dir = os.path.dirname(osu_songs_dir)
+                    osu_exe_path = os.path.join(osu_dir, "osu!.exe")
+                    
+                    create_coll = input(_('ask_collection', name=coll_name)).strip().lower()
+                    if create_coll == 'y':
+                        if is_osu_running():
+                            print(_('close_osu_warning'))
+                            while is_osu_running():
+                                input(_('close_osu_prompt'))
+                        
+                        print(_('calc_hashes'))
+                        all_md5s = []
+                        for fpath in downloaded_files:
+                            all_md5s.extend(get_osz_md5s(fpath))
+                            
+                        db_path = os.path.join(osu_dir, "collection.db")
+                        update_collection_db(db_path, coll_name, all_md5s)
+                        print(_('collection_created', count=len(all_md5s), name=coll_name))
+
                     print(_('moving_files'))
                     moved_count = 0
                     for file in downloaded_files:
@@ -334,8 +479,7 @@ def main():
                     print(_('install_success', count=moved_count))
                     print(_('press_f5'))
                     
-                    osu_exe_path = os.path.join(os.path.dirname(osu_songs_dir), "osu!.exe")
-                    if os.path.exists(osu_exe_path):
+                    if os.path.exists(osu_exe_path) and not is_osu_running():
                         launch_choice = input(_('launch_osu')).strip().lower()
                         if launch_choice == 'y':
                             print(_('launching'))
